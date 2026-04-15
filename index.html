@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>비용실적 분석시스템 - 한라엔컴㈜</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',sans-serif;background:#f0f4f8;}
+    ::-webkit-scrollbar{width:6px;height:6px;}
+    ::-webkit-scrollbar-track{background:#f1f5f9;}
+    ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px;}
+    @keyframes spin{to{transform:rotate(360deg);}}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+const XLSX = window.XLSX;
+
+/* ─── 상수 ─── */
+const DEFAULT_CREDS={id:"admin",pw:"halla2026"};
+const MFG_KW=["부재료","노무비","시간외","외주가공","전력비","연료비","수도광열","소모품비","수선","보험료(제)","임차료(제)","감가상각비(제)","잡비(제)","제조간접","작업","생산"];
+const SGA_KW=["급여","상여","퇴직급여","복리후생","여비교통","통신비","수도광열비","세금과공과","임차료(판)","감가상각비(판)","보험료(판)","광고선전","접대비","기부금","판매수수료","운반비","도서인쇄","소모품비(판)","잡비(판)","잡급","수수료","지급수수료"];
+const EXCLUDE_KW=["레미콘 제품원가","제조원가","재료비","도급비","급료","임금","제품원가","상품원가","타계정으로대체"];
+const ANOMALY_AMT=5000000;
+const EXCLUDE_DISPLAY=["레미콘 제품원가","제조원가","재료비","도급비","급료","임금","제품원가","상품원가","타계정으로대체액"];
+
+/* ─── 헬퍼 ─── */
+const normAcc=acc=>{const s=String(acc||""),i=s.indexOf("_");return i>0?s.slice(0,i).trim():s.trim();};
+const classify=acc=>{const n=normAcc(acc);if(MFG_KW.some(k=>n.includes(k)))return"제조경비";if(SGA_KW.some(k=>n.includes(k)))return"판관비";return"기타";};
+const isHQ=unit=>["본사","HQ","관리부"].some(k=>String(unit).includes(k));
+const fmt=n=>(n==null||isNaN(n))?"-":Math.round(n).toLocaleString("ko-KR");
+const fmtM=n=>{const v=n||0;if(Math.abs(v)>=100000000)return(v/100000000).toFixed(2)+"억";if(Math.abs(v)>=10000000)return(v/10000000).toFixed(1)+"천만";return Math.round(v/10000).toLocaleString()+"만";};
+const fmtAmt=n=>{if(!n||isNaN(n))return"";const a=Math.abs(Math.round(n));if(a>=100000000)return(Math.round(n/100000000*10)/10).toFixed(1)+"억";if(a>=10000000)return Math.round(n/10000000)+"천만";if(a>=10000)return Math.round(n/10000)+"만";return Math.round(n).toLocaleString()+"원";};
+const dColor=d=>d>0?"#dc2626":d<0?"#16a34a":"#94a3b8";
+const dLabel=d=>(d>0?"+":"")+fmt(d);
+const pctS=(c,p)=>{if(!p||p===0)return c>0?"신규":"-";const v=(c-p)/Math.abs(p)*100;return(v>0?"▲":"▼")+Math.abs(v).toFixed(1)+"%";};
+const pctC=(c,p)=>!p?"#94a3b8":c>p?"#dc2626":c<p?"#16a34a":"#94a3b8";
+const mLabel=m=>m&&m.length>=6?`${m.slice(0,4)}년 ${parseInt(m.slice(4,6))}월`:(m||"");
+
+/* ─── localStorage ─── */
+const lsGet=k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}};
+const lsList=p=>{try{return Object.keys(localStorage).filter(k=>k.startsWith(p));}catch{return[];}};
+const lsDel=k=>{try{localStorage.removeItem(k);}catch{}};
+
+/* ─── ERP 파싱 ─── */
+function parseDate(v){
+  if(!v&&v!==0)return"";
+  if(typeof v==="number"){try{const d=XLSX.SSF.parse_date_code(v);if(d)return`${d.y}${String(d.m).padStart(2,"0")}`;}catch{}}
+  const s=String(v).replace(/\D/g,"");return s.length>=6?s.slice(0,6):"";
+}
+function parseERP(wb){
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  const recs=[];
+  for(let i=1;i<rows.length;i++){
+    const r=rows[i];
+    const month=parseDate(r[1]),unit=String(r[3]||"").trim(),acc=String(r[16]||"").trim();
+    const amt=typeof r[17]==="number"?r[17]:parseFloat(String(r[17]).replace(/,/g,""))||0;
+    const memo=String(r[21]||"").trim();
+    if(!unit||!acc||amt===0)continue;
+    if(EXCLUDE_KW.some(k=>acc.includes(k)))continue;
+    recs.push({month,unit,acc,amt,memo});
+  }
+  return recs;
+}
+
+/* ─── aggregate: 적요를 금액과 함께 저장, 금액순 정렬 ─── */
+function aggregate(recs){
+  const res={};
+  recs.forEach(r=>{
+    if(!r.month)return;
+    const na=normAcc(r.acc);
+    if(!res[r.month])res[r.month]={};
+    if(!res[r.month][r.unit])res[r.month][r.unit]={};
+    if(!res[r.month][r.unit][na])res[r.month][r.unit][na]={amt:0,memoMap:{},cat:classify(r.acc)};
+    const entry=res[r.month][r.unit][na];
+    entry.amt+=r.amt;
+    // 적요별 금액 합산
+    if(r.memo){entry.memoMap[r.memo]=(entry.memoMap[r.memo]||0)+r.amt;}
+  });
+  // memoMap → 금액순 정렬된 [{text,amt}] 배열로 변환
+  Object.values(res).forEach(mo=>Object.values(mo).forEach(un=>Object.values(un).forEach(entry=>{
+    entry.memos=Object.entries(entry.memoMap).map(([text,amt])=>({text,amt})).sort((a,b)=>b.amt-a.amt);
+    delete entry.memoMap;
+  })));
+  return res;
+}
+
+/* ─── buildCompare ─── */
+function buildCompare(cA,pA){
+  const allU=new Set([...Object.keys(cA),...Object.keys(pA)]);
+  const units=[],totals={curr:{mfg:0,sga:0,etc:0},prev:{mfg:0,sga:0,etc:0}};
+  allU.forEach(unit=>{
+    const ca=cA[unit]||{},pa=pA[unit]||{};
+    const allAccs=new Set([...Object.keys(ca),...Object.keys(pa)]);
+    const accs=[],ut={curr:{mfg:0,sga:0,etc:0},prev:{mfg:0,sga:0,etc:0}};
+    allAccs.forEach(acc=>{
+      const c=ca[acc]?.amt||0,p=pa[acc]?.amt||0;
+      const cat=ca[acc]?.cat||pa[acc]?.cat||classify(acc);
+      // 당월 적요 우선, 없으면 전월 적요 사용 (모두 [{text,amt}] 형식)
+      const memos=ca[acc]?.memos||pa[acc]?.memos||[];
+      accs.push({acc,cat,c,p,diff:c-p,memos});
+      const k=cat==="제조경비"?"mfg":cat==="판관비"?"sga":"etc";
+      ut.curr[k]+=c;ut.prev[k]+=p;
+    });
+    accs.sort((a,b)=>b.c-a.c); // 당월 금액 내림차순
+    ["mfg","sga","etc"].forEach(k=>{totals.curr[k]+=ut.curr[k];totals.prev[k]+=ut.prev[k];});
+    const tc=ut.curr.mfg+ut.curr.sga+ut.curr.etc,tp=ut.prev.mfg+ut.prev.sga+ut.prev.etc;
+    units.push({unit,accs,curr:ut.curr,prev:ut.prev,totalCurr:tc,totalPrev:tp});
+  });
+  units.sort((a,b)=>b.totalCurr-a.totalCurr);
+  return{units,totals};
+}
+
+/* ─── Gemini API (모델 폴백 + 재시도) ─── */
+async function callGemini(prompt,apiKey){
+  const MODELS=["gemini-2.5-flash","gemini-2.0-flash","gemini-1.5-flash"];
+  const WAIT=[5000,12000,25000];
+  const isOverload=msg=>["high demand","overloaded","unavailable","503","quota"].some(k=>String(msg).toLowerCase().includes(k));
+  for(let mi=0;mi<MODELS.length;mi++){
+    for(let at=0;at<3;at++){
+      try{
+        const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mi]}:generateContent?key=${apiKey}`,
+          {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({contents:[{parts:[{text:prompt}]}]})});
+        const d=await res.json();
+        const errMsg=d.error?.message||((!res.ok)?"HTTP "+res.status:"");
+        if(errMsg){if(isOverload(errMsg)&&at<2){await new Promise(r=>setTimeout(r,WAIT[at]));continue;}if(isOverload(errMsg)){break;}throw new Error(errMsg);}
+        return d.candidates?.[0]?.content?.parts?.[0]?.text||"";
+      }catch(err){
+        if(isOverload(err.message)&&at<2){await new Promise(r=>setTimeout(r,WAIT[at]));continue;}
+        if(isOverload(err.message)){break;}
+        throw err;
+      }
+    }
+  }
+  throw new Error("모든 모델 과부하 상태. 잠시 후 다시 시도해주세요.");
+}
+
+async function analyze(compare,currentMonth,prevMonth,apiKey){
+  const{units,totals}=compare;
+  const tc=totals.curr,tp=totals.prev;
+  let p=`당신은 레미콘·골재 제조업 원가 및 경영분석 전문가입니다.
+${mLabel(prevMonth||"")} 대비 ${mLabel(currentMonth)} 비용 전표 데이터를 분석합니다.
+아래 지침을 반드시 준수하세요:
+1. 증감 원인은 적요 기반 팩트 중심. 추측 표현 금지.
+2. 금액은 반드시 원 단위로 명시 (예: 1,234만원, 2.3억원).
+3. 구조적 증감(정기적·계절적)과 비구조적 증감(일회성·이상)을 구분하여 서술.
+4. 전체 요약은 핵심 수치 → 주요 원인 → 관리 포인트 순서로 작성.
+5. 핵심 분석 결과는 각각 "어느 단위의 어느 계정이 얼마 변동했고 원인은 무엇"인지 구체적으로.
+6. 문체: "~함","~임","~증가함","~감소함" 등 명사형 종결. "~했습니다","~입니다" 금지.
+7. JSON 형식으로만 응답 (마크다운 없이).
+
+[전체 비용 변동]
+- 제조경비: ${fmt(tp.mfg)}원 → ${fmt(tc.mfg)}원 (${dLabel(tc.mfg-tp.mfg)}원, ${pctS(tc.mfg,tp.mfg)})
+- 판관비: ${fmt(tp.sga)}원 → ${fmt(tc.sga)}원 (${dLabel(tc.sga-tp.sga)}원, ${pctS(tc.sga,tp.sga)})
+- 합계: ${fmt(tp.mfg+tp.sga+tp.etc)}원 → ${fmt(tc.mfg+tc.sga+tc.etc)}원\n\n`;
+  units.forEach(u=>{
+    const changes=u.accs.filter(a=>Math.abs(a.diff)>=100000);
+    if(!changes.length)return;
+    p+=`▶ ${u.unit} (당월: ${fmt(u.totalCurr)}원, 증감: ${dLabel(u.totalCurr-u.totalPrev)}원)\n`;
+    changes.slice(0,7).forEach(a=>{
+      p+=`  • ${a.acc}(${a.cat}): ${fmt(a.p)}→${fmt(a.c)} (${dLabel(a.diff)}원)\n`;
+      if(a.memos.length)p+=`    [적요] ${a.memos.slice(0,4).map(m=>m.text+"("+fmtAmt(m.amt)+")").join(" / ")}\n`;
+    });
+    p+="\n";
+  });
+  p+=`응답 JSON:
+{"overallComment":"핵심 수치 → 주요 원인 → 관리 포인트 순서로 4~6문장. 주요 단위명·계정과목·금액 반드시 포함. 전체 증감률 명시.",
+"keyInsights":["[단위명] [계정과목] [금액] [증감률] — [원인 및 구분(구조적/일회성)]","동일 형식으로 작성","동일 형식으로 작성"],
+"warnings":["[단위명] [계정과목]: [급등/급락 이유 및 검토 필요 사항]","동일 형식"],
+"unitComments":{"전표관리단위명":{"summary":"당월 합계 [금액], 전월 대비 [증감액]([증감률]). 주요 증감 원인 1~2문장.","details":["[계정과목] [금액변동]: [적요 기반 구체적 원인]","동일 형식","동일 형식"]}}}`;
+  const text=await callGemini(p,apiKey);
+  const clean=text.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim();
+  try{return JSON.parse(clean);}catch{return{overallComment:text,keyInsights:[],warnings:[],unitComments:{}};}
+}
+
+/* ─── Excel 전문가급 내보내기 (A3 가로, 완전 스타일) ─── */
+function exportXLS(result){
+  const{comparison,aiComments,currentMonth,prevMonth}=result;
+  const{units,totals}=comparison;
+  const wb=XLSX.utils.book_new();
+  const now=new Date().toLocaleDateString("ko-KR");
+  const period=`${prevMonth?mLabel(prevMonth)+" → ":""}${mLabel(currentMonth)}`;
+  const tc=totals.curr,tp=totals.prev;
+  const gc=tc.mfg+tc.sga+tc.etc,gp=tp.mfg+tp.sga+tp.etc;
+
+  /* ── 색상 팔레트 ── */
+  const CLR={
+    navy:"0F2040",navyL:"1A3A6E",blue:"1D4ED8",blueL:"DBEAFE",
+    red:"DC2626",redL:"FEF2F2",redM:"FCA5A5",
+    green:"16A34A",greenL:"F0FDF4",greenM:"BBF7D0",
+    amber:"D97706",amberL:"FFFBEB",amberM:"FDE047",
+    gray:"475569",grayL:"F8FAFC",grayLL:"F1F5F9",
+    white:"FFFFFF",black:"0F172A",
+    row1:"EFF6FF",row2:"FFFFFF",
+  };
+
+  /* ── 스타일 빌더 ── */
+  const bdr=(style="thin",color=CLR.grayLL)=>({style,color:{rgb:color}});
+  const allBdr=(s="thin",col=CLR.grayLL)=>({top:bdr(s,col),bottom:bdr(s,col),left:bdr(s,col),right:bdr(s,col)});
+  const mkS=(font={},fill=CLR.white,align={},border=allBdr())=>({font:{sz:10,...font},fill:{fgColor:{rgb:fill}},alignment:{vertical:"center",...align},border});
+  
+  const S={
+    /* 제목 영역 */
+    TITLE: mkS({sz:20,bold:true,color:{rgb:CLR.white}},CLR.navy,{horizontal:"center"},{top:bdr("medium",CLR.blue),bottom:bdr("medium",CLR.blue),left:bdr("medium",CLR.blue),right:bdr("medium",CLR.blue)}),
+    SUB:   mkS({sz:11,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"center"},allBdr("thin",CLR.navyL)),
+    /* KPI 박스 */
+    KPIL:  mkS({sz:11,bold:true,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"left"},allBdr("thin",CLR.navy)),
+    KPIV:  mkS({sz:18,bold:true,color:{rgb:CLR.white}},CLR.navy,{horizontal:"center"},allBdr("medium",CLR.blue)),
+    KPIU:  mkS({sz:10,color:{rgb:"93C5FD"}},CLR.navy,{horizontal:"center"},allBdr("thin",CLR.navy)),
+    KPIR:  (pos)=>mkS({sz:14,bold:true,color:{rgb:pos?"FCA5A5":"86EFAC"}},CLR.navy,{horizontal:"center"},allBdr("thin",CLR.navy)),
+    /* 섹션 헤더 */
+    SEC:   mkS({sz:12,bold:true,color:{rgb:CLR.navy}},CLR.row1,{horizontal:"left"},{top:bdr("medium",CLR.blue),bottom:bdr("medium",CLR.blue),left:bdr("medium",CLR.blue),right:bdr(),"left":{style:"medium",color:{rgb:CLR.blue}}}),
+    /* 컬럼 헤더 */
+    HDR:   mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"center"},{top:bdr("medium",CLR.navyL),bottom:bdr("medium",CLR.blue),left:bdr("thin",CLR.navy),right:bdr("thin",CLR.navy)}),
+    HDRR:  mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"right"},{top:bdr("medium",CLR.navyL),bottom:bdr("medium",CLR.blue),left:bdr("thin",CLR.navy),right:bdr("thin",CLR.navy)}),
+    /* 데이터 행 */
+    D0L:   mkS({sz:10},CLR.row1,{horizontal:"left"},allBdr()),
+    D0R:   mkS({sz:10},CLR.row1,{horizontal:"right"},allBdr()),
+    D1L:   mkS({sz:10},CLR.row2,{horizontal:"left"},allBdr()),
+    D1R:   mkS({sz:10},CLR.row2,{horizontal:"right"},allBdr()),
+    /* 소계/합계 */
+    TOTL:  mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navy,{horizontal:"left"},{top:bdr("medium",CLR.blue),bottom:bdr("medium",CLR.blue),left:bdr("thin",CLR.navy),right:bdr("thin",CLR.navy)}),
+    TOTR:  mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navy,{horizontal:"right"},{top:bdr("medium",CLR.blue),bottom:bdr("medium",CLR.blue),left:bdr("thin",CLR.navy),right:bdr("thin",CLR.navy)}),
+    /* 단위 소계 */
+    UNITL: mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"left"},allBdr("thin",CLR.navyL)),
+    UNITR: mkS({sz:10,bold:true,color:{rgb:CLR.white}},CLR.navyL,{horizontal:"right"},allBdr("thin",CLR.navyL)),
+    /* 이상 항목 */
+    ANOL:  mkS({sz:10,bold:true,color:{rgb:CLR.red}},CLR.redL,{horizontal:"left"},allBdr("thin",CLR.redM)),
+    ANOR:  mkS({sz:10,bold:true,color:{rgb:CLR.red}},CLR.redL,{horizontal:"right"},allBdr("thin",CLR.redM)),
+    /* 증감 색상 */
+    UP:    (bg=CLR.row1)=>mkS({sz:10,bold:true,color:{rgb:CLR.red}},bg,{horizontal:"right"},allBdr()),
+    DN:    (bg=CLR.row1)=>mkS({sz:10,bold:true,color:{rgb:CLR.green}},bg,{horizontal:"right"},allBdr()),
+    /* 적요 */
+    MEMO:  mkS({sz:9,color:{rgb:CLR.gray}},CLR.grayLL,{horizontal:"left",wrapText:true},allBdr()),
+    /* 분석코멘트 */
+    CMHDR: mkS({sz:11,bold:true,color:{rgb:CLR.white}},CLR.navy,{horizontal:"left"},allBdr("medium",CLR.blue)),
+    CMBDY: mkS({sz:10,color:{rgb:CLR.black}},CLR.white,{horizontal:"left",wrapText:true},allBdr()),
+    CMBLU: mkS({sz:10,color:{rgb:CLR.black}},CLR.blueL,{horizontal:"left",wrapText:true},{top:bdr(),bottom:bdr(),left:bdr("medium",CLR.blue),right:bdr()}),
+    CMRED: mkS({sz:10,bold:true,color:{rgb:CLR.red}},CLR.redL,{horizontal:"left",wrapText:true},allBdr("thin",CLR.redM)),
+  };
+
+  /* ── 셀 생성 헬퍼 ── */
+  const C=(v,s)=>{
+    if(v==null||v==="")return{v:"",t:"s",s};
+    if(typeof v==="number")return{v,t:"n",s,z:"#,##0"};
+    return{v,t:"s",s};
+  };
+
+  /* ── 비주얼 바 (셀 내 데이터바 표현) ── */
+  const vizBar=(v,maxV,len=8)=>{
+    if(!maxV||maxV<=0)return"";
+    const n=Math.max(0,Math.min(len,Math.round(Math.abs(v)/maxV*len)));
+    return"▇".repeat(n)+"░".repeat(len-n)+" "+Math.round(Math.abs(v)/maxV*100)+"%";
+  };
+
+  /* ── 금액 축약 ── */
+  const fmtBil=n=>{if(!n)return"-";const a=Math.abs(n);if(a>=100000000)return(n/100000000).toFixed(2)+"억";if(a>=10000000)return(n/10000000).toFixed(1)+"천만";return Math.round(n/10000)+"만";};
+  const fmtPct=(c,p)=>{if(!p||p===0)return c>0?"신규":"-";const v=(c-p)/Math.abs(p)*100;return(v>0?"▲":"▼")+Math.abs(v).toFixed(1)+"%";};
+
+  const pageSetup={paperSize:8,orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0};
+  const margins={left:0.35,right:0.35,top:0.5,bottom:0.5,header:0.2,footer:0.2};
+
+  /* ═══════════════════════════════════════════════
+     시트 1: 경영진 요약 대시보드
+     ═══════════════════════════════════════════════ */
+  const ws1={};let r=0;
+
+  /* 제목 */
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("한라엔컴㈜  비용실적 분석 보고서",S.TITLE);
+  ws1[XLSX.utils.encode_cell({r:r+1,c:0})]=C(`분석 기간: ${period}　　작성일: ${now}　　전표관리단위: ${units.length}개　　분석 계정: 제조경비·판관비·기타`,S.SUB);
+  r+=3;
+
+  /* ── KPI 박스 (4개) ── */
+  const dTotal=gc-gp;
+  const kpis=[
+    {label:"당월 총비용",val:fmtBil(gc),unit:"원",chg:fmtPct(gc,gp),pos:dTotal>0},
+    {label:"전월 대비 증감",val:(dTotal>=0?"+":"")+fmtBil(dTotal),unit:"원",chg:fmtPct(gc,gp),pos:dTotal>0},
+    {label:"제조경비",val:fmtBil(tc.mfg),unit:`비중 ${gc>0?(tc.mfg/gc*100).toFixed(0):0}%`,chg:fmtPct(tc.mfg,tp.mfg),pos:tc.mfg>tp.mfg},
+    {label:"판관비",val:fmtBil(tc.sga),unit:`비중 ${gc>0?(tc.sga/gc*100).toFixed(0):0}%`,chg:fmtPct(tc.sga,tp.sga),pos:tc.sga>tp.sga},
+  ];
+  const kpiCols=[0,3,6,9]; // 각 KPI 3열씩
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("■ 핵심 지표",{...S.SEC,font:{sz:11,bold:true,color:{rgb:CLR.navy}}});
+  r++;
+  kpis.forEach((k,ki)=>{
+    const bc=kpiCols[ki];
+    ws1[XLSX.utils.encode_cell({r,c:bc})]=C(k.label,S.KPIL);
+    ws1[XLSX.utils.encode_cell({r:r+1,c:bc})]=C(k.val,S.KPIV);
+    ws1[XLSX.utils.encode_cell({r:r+2,c:bc})]=C(k.unit,S.KPIU);
+    ws1[XLSX.utils.encode_cell({r:r+3,c:bc})]=C(k.chg,S.KPIR(k.pos));
+  });
+  r+=5;
+
+  /* ── 구분별 요약 + 비주얼 바 ── */
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("■ 비용 구분별 요약",S.SEC);r++;
+  const h1=["구분","전월","당월","증감액","증감률","당월 비중","전월 비중","구성비 시각화"];
+  h1.forEach((h,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=C(h,ci>=1?S.HDRR:S.HDR));r++;
+  const cats=[{l:"제조경비",c:tc.mfg,p:tp.mfg},{l:"판관비",c:tc.sga,p:tp.sga},{l:"기타",c:tc.etc,p:tp.etc}];
+  cats.forEach((row,i)=>{
+    const d=row.c-row.p,bg=i%2===0?S.D0R:S.D1R,bgL=i%2===0?S.D0L:S.D1L;
+    const share=gc>0?(row.c/gc*100).toFixed(1)+"%":"-";
+    const pshare=gp>0?(row.p/gp*100).toFixed(1)+"%":"-";
+    [C(row.l,bgL),C(row.p,bg),C(row.c,bg),C(d,d>0?S.UP(i%2===0?CLR.row1:CLR.row2):S.DN(i%2===0?CLR.row1:CLR.row2)),C(fmtPct(row.c,row.p),d>0?S.UP(i%2===0?CLR.row1:CLR.row2):S.DN(i%2===0?CLR.row1:CLR.row2)),C(share,bg),C(pshare,bg),C(vizBar(row.c,gc),{...bgL,font:{sz:9,color:{rgb:CLR.blue}}})].forEach((cell,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=cell);
+    r++;
+  });
+  [C("합  계",S.TOTL),C(gp,S.TOTR),C(gc,S.TOTR),C(dTotal,dTotal>0?{...S.TOTR,font:{sz:10,bold:true,color:{rgb:"FCA5A5"}}}:{...S.TOTR,font:{sz:10,bold:true,color:{rgb:"86EFAC"}}}),C(fmtPct(gc,gp),S.TOTR),C("100%",S.TOTR),C("100%",S.TOTR),C("▇".repeat(8),{...S.TOTR,font:{sz:9,color:{rgb:"93C5FD"}}})].forEach((cell,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=cell);
+  r+=2;
+
+  /* ── 전표관리단위 요약 ── */
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("■ 전표관리단위 현황",S.SEC);r++;
+  const h2=["전표관리단위","구분","당월","전월","증감액","증감률","전체비중","비용구성(제조/판관)","당월 규모 시각화","이상항목"];
+  h2.forEach((h,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=C(h,ci>=2?S.HDRR:S.HDR));r++;
+  const maxU=Math.max(...units.map(u=>u.totalCurr),1);
+  units.forEach((u,i)=>{
+    const d=u.totalCurr-u.totalPrev,bg=i%2===0?S.D0R:S.D1R,bgL=i%2===0?S.D0L:S.D1L;
+    const share=gc>0?(u.totalCurr/gc*100).toFixed(1)+"%":"-";
+    const comp=u.totalCurr>0?`제조 ${(u.curr.mfg/u.totalCurr*100).toFixed(0)}% / 판관 ${(u.curr.sga/u.totalCurr*100).toFixed(0)}%`:"-";
+    const anom=u.accs.filter(a=>Math.abs(a.diff)>=ANOMALY_AMT).length;
+    [C(u.unit,bgL),C(isHQ(u.unit)?"본사":"사업장",bgL),C(u.totalCurr,bg),C(u.totalPrev,bg),C(d,d>0?S.UP(i%2===0?CLR.row1:CLR.row2):S.DN(i%2===0?CLR.row1:CLR.row2)),C(fmtPct(u.totalCurr,u.totalPrev),d>0?S.UP(i%2===0?CLR.row1:CLR.row2):S.DN(i%2===0?CLR.row1:CLR.row2)),C(share,bg),C(comp,{...(i%2===0?S.D0L:S.D1L),font:{sz:9}}),C(vizBar(u.totalCurr,maxU),{...bgL,font:{sz:9,color:{rgb:CLR.blue}}}),C(anom>0?`⚠ ${anom}건`:"",anom>0?{...S.ANOR,font:{sz:10,bold:true,color:{rgb:CLR.red}}}:bg)].forEach((cell,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=cell);
+    r++;
+  });
+  r+=2;
+
+  /* ── 주요 증감 TOP 10 ── */
+  const allFlat=[];
+  units.forEach(u=>u.accs.forEach(a=>allFlat.push({...a,unit:u.unit})));
+  allFlat.sort((a,b)=>Math.abs(b.diff)-Math.abs(a.diff));
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("■ 주요 증감 항목 TOP 10",S.SEC);r++;
+  ["순위","전표관리단위","계정과목","구분","전월","당월","증감액","증감률","증감 시각화","주요 적요 (금액순)"].forEach((h,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=C(h,ci>=4&&ci<=7?S.HDRR:S.HDR));r++;
+  const maxDiff=Math.max(...allFlat.slice(0,10).map(a=>Math.abs(a.diff)),1);
+  allFlat.slice(0,10).forEach((a,i)=>{
+    const anom=Math.abs(a.diff)>=ANOMALY_AMT;
+    const bg=anom?(a.diff>0?S.UP(CLR.redL):S.DN(CLR.greenL)):(i%2===0?S.D0R:S.D1R);
+    const bgL=anom?(a.diff>0?{...S.ANOL}:{...S.ANOL,font:{sz:10,bold:true,color:{rgb:CLR.green}},fill:{fgColor:{rgb:CLR.greenL}},border:allBdr("thin",CLR.greenM)}):(i%2===0?S.D0L:S.D1L);
+    const memoStr=a.memos.slice(0,3).map(m=>m.text+"("+fmtBil(m.amt)+")").join(" │ ");
+    const rankStyle=i<3?{...bgL,font:{sz:11,bold:true,color:{rgb:i===0?"D97706":i===1?"6B7280":"92400E"}}}:bgL;
+    [C(["①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩"][i]||i+1,rankStyle),C(a.unit,bgL),C((anom?"⚠ ":"")+a.acc,bgL),C(a.cat,bgL),C(a.p,bg),C(a.c,bg),C(a.diff,a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C(fmtPct(a.c,a.p),a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C((a.diff>0?"▲":"▼")+" "+vizBar(Math.abs(a.diff),maxDiff,6),{...bgL,font:{sz:9,color:{rgb:a.diff>0?CLR.red:CLR.green}}}),C(memoStr,{...S.MEMO,fill:{fgColor:{rgb:anom?CLR.redL:CLR.grayLL}}})].forEach((cell,ci)=>ws1[XLSX.utils.encode_cell({r,c:ci})]=cell);
+    r++;
+  });
+  r++;
+
+  /* ── 분석 제외 항목 안내 ── */
+  ws1[XLSX.utils.encode_cell({r,c:0})]=C("※ 분석 제외 계정과목: "+EXCLUDE_DISPLAY.join(", ")+"  (이중계상 방지 목적)",{...S.MEMO,font:{sz:9,italic:true,color:{rgb:CLR.amber}}});
+  r++;
+
+  ws1["!ref"]=XLSX.utils.encode_range({s:{r:0,c:0},e:{r,c:9}});
+  ws1["!merges"]=[
+    {s:{r:0,c:0},e:{r:0,c:9}},{s:{r:1,c:0},e:{r:1,c:9}},
+    ...kpis.map((_,ki)=>[
+      {s:{r:4,c:kpiCols[ki]},e:{r:4,c:kpiCols[ki]+2}},
+      {s:{r:5,c:kpiCols[ki]},e:{r:5,c:kpiCols[ki]+2}},
+      {s:{r:6,c:kpiCols[ki]},e:{r:6,c:kpiCols[ki]+2}},
+      {s:{r:7,c:kpiCols[ki]},e:{r:7,c:kpiCols[ki]+2}},
+    ]).flat(),
+  ];
+  ws1["!cols"]=[{wch:22},{wch:8},{wch:16},{wch:16},{wch:16},{wch:10},{wch:10},{wch:22},{wch:20},{wch:16}];
+  ws1["!rows"]=[{hpt:40},{hpt:20}];
+  ws1["!pageSetup"]=pageSetup;ws1["!margins"]=margins;
+  XLSX.utils.book_append_sheet(wb,ws1,"경영요약");
+
+  /* ═══════════════════════════════════════════════
+     시트 2: 전표관리단위별 상세
+     ═══════════════════════════════════════════════ */
+  const ws2={};let r2=0;
+  ws2[XLSX.utils.encode_cell({r:r2,c:0})]=C("전표관리단위별 비용 상세 분석",S.TITLE);
+  ws2[XLSX.utils.encode_cell({r:r2+1,c:0})]=C(`${period}　　작성일: ${now}　　※ 계정과목 당월 금액 내림차순 정렬`,S.SUB);
+  r2+=3;
+  ["전표관리단위","계정과목","구분","전월","당월","증감액","증감률","단위비중","적요 (금액순, 상위 5건)"].forEach((h,ci)=>ws2[XLSX.utils.encode_cell({r:r2,c:ci})]=C(h,ci>=3&&ci<=6?S.HDRR:S.HDR));r2++;
+  units.forEach(u=>{
+    const ud=u.totalCurr-u.totalPrev;
+    const ushare=gc>0?(u.totalCurr/gc*100).toFixed(1)+"%":"-";
+    [C(u.unit,S.UNITL),C(`[소계] 제조 ${fmtBil(u.curr.mfg)} / 판관 ${fmtBil(u.curr.sga)} / 기타 ${fmtBil(u.curr.etc)}`,S.UNITL),C("",S.UNITR),C(u.totalPrev,S.UNITR),C(u.totalCurr,S.UNITR),C(ud,ud>0?{...S.UNITR,font:{sz:10,bold:true,color:{rgb:"FCA5A5"}}}:{...S.UNITR,font:{sz:10,bold:true,color:{rgb:"86EFAC"}}}),C(fmtPct(u.totalCurr,u.totalPrev),S.UNITR),C(ushare,S.UNITR),C("",S.UNITR)].forEach((cell,ci)=>ws2[XLSX.utils.encode_cell({r:r2,c:ci})]=cell);r2++;
+    u.accs.forEach((a,i)=>{
+      const anom=Math.abs(a.diff)>=ANOMALY_AMT;
+      const bg=anom?S.ANOR:(i%2===0?S.D0R:S.D1R);const bgL=anom?S.ANOL:(i%2===0?S.D0L:S.D1L);
+      const share2=u.totalCurr>0?(a.c/u.totalCurr*100).toFixed(1)+"%":"-";
+      const memoStr=a.memos.slice(0,5).map(m=>m.text+" ("+fmtBil(m.amt)+")").join(" │ ");
+      [C("",bgL),C((anom?"⚠ ":"")+a.acc,bgL),C(a.cat,bgL),C(a.p,bg),C(a.c,{...bg,font:{sz:10,bold:a.c>0}}),C(a.diff,a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C(fmtPct(a.c,a.p),a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C(share2,bg),C(memoStr,{...S.MEMO,fill:{fgColor:{rgb:anom?CLR.redL:CLR.grayLL}}})].forEach((cell,ci)=>ws2[XLSX.utils.encode_cell({r:r2,c:ci})]=cell);r2++;
+    });
+    r2++;
+  });
+  ws2[XLSX.utils.encode_cell({r:r2,c:0})]=C("※ 분석 제외: "+EXCLUDE_DISPLAY.join(", "),{...S.MEMO,font:{sz:9,italic:true,color:{rgb:CLR.amber}}});r2++;
+  ws2["!ref"]=XLSX.utils.encode_range({s:{r:0,c:0},e:{r:r2,c:8}});
+  ws2["!merges"]=[{s:{r:0,c:0},e:{r:0,c:8}},{s:{r:1,c:0},e:{r:1,c:8}}];
+  ws2["!cols"]=[{wch:22},{wch:22},{wch:10},{wch:16},{wch:16},{wch:16},{wch:10},{wch:10},{wch:60}];
+  ws2["!rows"]=[{hpt:40},{hpt:20}];
+  ws2["!pageSetup"]=pageSetup;ws2["!margins"]=margins;
+  XLSX.utils.book_append_sheet(wb,ws2,"단위별상세");
+
+  /* ═══════════════════════════════════════════════
+     시트 3: 주요증감 TOP 30
+     ═══════════════════════════════════════════════ */
+  const ws3={};let r3=0;
+  ws3[XLSX.utils.encode_cell({r:r3,c:0})]=C("주요 비용 증감 항목 TOP 30",S.TITLE);
+  ws3[XLSX.utils.encode_cell({r:r3+1,c:0})]=C(`${period}　　증감액 절대값 내림차순　　⚠ 표시: 500만원 이상 이상 항목`,S.SUB);
+  r3+=3;
+  ["순위","전표관리단위","계정과목","구분","전월","당월","증감액","증감률","증감 크기","주요 적요 (금액순)"].forEach((h,ci)=>ws3[XLSX.utils.encode_cell({r:r3,c:ci})]=C(h,ci>=4&&ci<=7?S.HDRR:S.HDR));r3++;
+  const maxD=Math.max(...allFlat.slice(0,30).map(a=>Math.abs(a.diff)),1);
+  allFlat.slice(0,30).forEach((a,i)=>{
+    const anom=Math.abs(a.diff)>=ANOMALY_AMT;
+    const bg=anom?(a.diff>0?S.UP(CLR.redL):S.DN(CLR.greenL)):(i%2===0?S.D0R:S.D1R);
+    const bgL=anom?(a.diff>0?S.ANOL:{...S.ANOL,font:{sz:10,bold:true,color:{rgb:CLR.green}},fill:{fgColor:{rgb:CLR.greenL}},border:allBdr("thin",CLR.greenM)}):(i%2===0?S.D0L:S.D1L);
+    const memoStr=a.memos.slice(0,5).map(m=>m.text+" ("+fmtBil(m.amt)+")").join(" │ ");
+    const bar=(a.diff>0?"▲":"▼")+" "+vizBar(Math.abs(a.diff),maxD,6);
+    [C(i+1,{...bgL,font:{sz:10,bold:i<3,color:{rgb:i===0?"D97706":i===1?"6B7280":i===2?"92400E":bgL.font?.color?.rgb||CLR.black}}}),C(a.unit,bgL),C((anom?"⚠ ":"")+a.acc,bgL),C(a.cat,bgL),C(a.p,bg),C(a.c,bg),C(a.diff,a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C(fmtPct(a.c,a.p),a.diff>0?S.UP(anom?CLR.redL:i%2===0?CLR.row1:CLR.row2):S.DN(anom?CLR.greenL:i%2===0?CLR.row1:CLR.row2)),C(bar,{...bgL,font:{sz:9,color:{rgb:a.diff>0?CLR.red:CLR.green}}}),C(memoStr,{...S.MEMO,fill:{fgColor:{rgb:anom?CLR.redL:CLR.grayLL}}})].forEach((cell,ci)=>ws3[XLSX.utils.encode_cell({r:r3,c:ci})]=cell);r3++;
+  });
+  ws3["!ref"]=XLSX.utils.encode_range({s:{r:0,c:0},e:{r:r3,c:9}});
+  ws3["!merges"]=[{s:{r:0,c:0},e:{r:0,c:9}},{s:{r:1,c:0},e:{r:1,c:9}}];
+  ws3["!cols"]=[{wch:6},{wch:20},{wch:20},{wch:10},{wch:16},{wch:16},{wch:16},{wch:10},{wch:16},{wch:60}];
+  ws3["!rows"]=[{hpt:40},{hpt:20}];
+  ws3["!pageSetup"]=pageSetup;ws3["!margins"]=margins;
+  XLSX.utils.book_append_sheet(wb,ws3,"주요증감TOP30");
+
+  /* ═══════════════════════════════════════════════
+     시트 4: 분석 코멘트
+     ═══════════════════════════════════════════════ */
+  const ws4={};let r4=0;
+  ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("비용 증감 분석 코멘트",S.TITLE);
+  ws4[XLSX.utils.encode_cell({r:r4+1,c:0})]=C(`${period}　　작성일: ${now}`,S.SUB);
+  r4+=3;
+  if(aiComments?.overallComment){
+    ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("▣ 전체 요약",S.CMHDR);r4++;
+    ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C(aiComments.overallComment,{...S.CMBDY,fill:{fgColor:{rgb:CLR.blueL}},font:{sz:11,color:{rgb:CLR.navy}}});r4+=2;
+  }
+  if(aiComments?.keyInsights?.length){
+    ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("▣ 핵심 분석 결과",S.CMHDR);r4++;
+    aiComments.keyInsights.forEach((k,i)=>{ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C(`${["①","②","③"][i]||i+1}  ${k}`,S.CMBLU);r4++;});r4++;
+  }
+  if(aiComments?.warnings?.length){
+    ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("▣ 주의 항목 (이상 징후 및 검토 필요)",{...S.CMHDR,fill:{fgColor:{rgb:"7F1D1D"}}});r4++;
+    aiComments.warnings.forEach(w=>{ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("⚠  "+w,S.CMRED);r4++;});r4++;
+  }
+  if(aiComments?.unitComments){
+    ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("▣ 전표관리단위별 세부 분석",S.CMHDR);r4++;
+    Object.entries(aiComments.unitComments).forEach(([unit,cm])=>{
+      ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C(`[ ${unit} ]`,{...S.CMHDR,fill:{fgColor:{rgb:CLR.navyL}}});r4++;
+      ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C(cm.summary,{...S.CMBDY,font:{sz:10,bold:true,color:{rgb:CLR.navy}}});r4++;
+      cm.details?.forEach(d=>{ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("•  "+d,S.CMBLU);r4++;});
+      r4++;
+    });
+  }
+  ws4[XLSX.utils.encode_cell({r:r4,c:0})]=C("※ 분석 제외 계정과목: "+EXCLUDE_DISPLAY.join(", ")+"  (이중계상 방지 및 집계 대분류 항목)",{...S.MEMO,font:{sz:9,italic:true,color:{rgb:CLR.amber}}});r4++;
+  ws4["!ref"]=XLSX.utils.encode_range({s:{r:0,c:0},e:{r:r4,c:0}});
+  ws4["!merges"]=[{s:{r:0,c:0},e:{r:0,c:0}},{s:{r:1,c:0},e:{r:1,c:0}}];
+  ws4["!cols"]=[{wch:150}];
+  ws4["!rows"]=[{hpt:40},{hpt:20}];
+  ws4["!pageSetup"]=pageSetup;ws4["!margins"]=margins;
+  XLSX.utils.book_append_sheet(wb,ws4,"분석코멘트");
+
+  XLSX.writeFile(wb,`비용실적분석_${currentMonth}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+
+/* ─── SVG 바 차트 ─── */
+function SvgBar({data}){
+  if(!data||!data.length)return <p style={{color:"#94a3b8",fontSize:13,padding:16}}>데이터 없음</p>;
+  const LABEL=130,PAD=8,W=520,BH=18,GAP=5;
+  const maxV=Math.max(...data.flatMap(d=>[d.prev,d.curr]),1);
+  const avail=W-LABEL-PAD;
+  const H=data.length*(BH*2+GAP+8)+20;
+  return(
+    <div style={{overflowX:"auto"}}>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{display:"block",minWidth:260}}>
+        {data.map((d,i)=>{
+          const y=16+i*(BH*2+GAP+8);
+          const pw=Math.max(Math.round(d.prev/maxV*avail),1);
+          const cw=Math.max(Math.round(d.curr/maxV*avail),1);
+          const up=d.curr>=d.prev;
+          return(
+            <g key={i}>
+              <text x={LABEL-4} y={y+BH-4} fontSize={11} fill="#475569" textAnchor="end">{d.name}</text>
+              <rect x={LABEL} y={y} width={pw} height={BH-2} fill="#cbd5e1" rx={2}/>
+              <text x={LABEL+pw+3} y={y+BH-5} fontSize={10} fill="#64748b">{fmtM(d.prev)}</text>
+              <rect x={LABEL} y={y+BH} width={cw} height={BH-2} fill={up?"#ef4444":"#22c55e"} rx={2}/>
+              <text x={LABEL+cw+3} y={y+BH*2-5} fontSize={10} fill={up?"#dc2626":"#16a34a"} fontWeight="600">{fmtM(d.curr)}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div style={{display:"flex",gap:16,fontSize:11,color:"#64748b",marginTop:4,paddingLeft:LABEL}}>
+        <span><span style={{display:"inline-block",width:12,height:8,background:"#cbd5e1",borderRadius:2,marginRight:3}}></span>전월</span>
+        <span><span style={{display:"inline-block",width:12,height:8,background:"#ef4444",borderRadius:2,marginRight:3}}></span>증가</span>
+        <span><span style={{display:"inline-block",width:12,height:8,background:"#22c55e",borderRadius:2,marginRight:3}}></span>감소</span>
+      </div>
+    </div>
+  );
+}
+function CostChart({units}){
+  const site=units.filter(u=>!isHQ(u.unit)),hq=units.filter(u=>isHQ(u.unit));
+  const toD=list=>list.map(u=>({name:u.unit.length>9?u.unit.slice(0,9)+"…":u.unit,prev:u.prev.mfg+u.prev.sga+u.prev.etc,curr:u.curr.mfg+u.curr.sga+u.curr.etc}));
+  return(
+    <div>
+      {site.length>0&&<div style={{marginBottom:hq.length>0?20:0}}>{hq.length>0&&<div style={{fontSize:11,fontWeight:700,color:"#475569",marginBottom:6}}>사업장</div>}<SvgBar data={toD(site)}/></div>}
+      {hq.length>0&&<div><div style={{fontSize:11,fontWeight:700,color:"#475569",marginBottom:6,paddingTop:site.length>0?8:0,borderTop:site.length>0?"1px solid #f1f5f9":"none"}}>본사</div><SvgBar data={toD(hq)}/></div>}
+    </div>
+  );
+}
+
+/* ─── 공통 UI ─── */
+function Card({title,children,mb=0,accent}){
+  return(
+    <div style={{background:"white",borderRadius:12,padding:"18px 20px",boxShadow:"0 1px 6px rgba(0,0,0,0.07)",marginBottom:mb,border:"1px solid #f1f5f9",borderTop:accent?`3px solid ${accent}`:"1px solid #f1f5f9"}}>
+      {title&&<h3 style={{fontSize:14,fontWeight:800,color:"#1e293b",margin:"0 0 14px",paddingBottom:10,borderBottom:"1px solid #f1f5f9"}}>{title}</h3>}
+      {children}
+    </div>
+  );
+}
+function Spinner(){return <span style={{display:"inline-block",width:14,height:14,border:"2px solid rgba(255,255,255,0.35)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.6s linear infinite",verticalAlign:"middle",marginRight:6}}/>;}
+function CatBadge({cat}){
+  const s={"제조경비":{bg:"#dbeafe",c:"#1d4ed8"},"판관비":{bg:"#ede9fe",c:"#6d28d9"}}[cat]||{bg:"#f0fdf4",c:"#166534"};
+  return <span style={{padding:"1px 7px",borderRadius:4,fontSize:10,fontWeight:600,background:s.bg,color:s.c}}>{cat}</span>;
+}
+/* 적요: 금액순, 옆에 금액 표시 */
+function MemoList({memos}){
+  if(!memos||!memos.length)return <span style={{color:"#cbd5e1",fontSize:11}}>-</span>;
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:3}}>
+      {memos.slice(0,3).map((m,i)=>(
+        <div key={i} style={{display:"flex",alignItems:"baseline",gap:4}}>
+          <span style={{display:"inline-block",padding:"1px 6px",background:"#f8fafc",borderRadius:4,border:"1px solid #e2e8f0",fontSize:11,flex:1}}>{m.text}</span>
+          <span style={{fontSize:10,fontWeight:700,color:"#1e40af",whiteSpace:"nowrap",flexShrink:0}}>{fmtAmt(m.amt)}</span>
+        </div>
+      ))}
+      {memos.length>3&&<span style={{fontSize:10,color:"#94a3b8",paddingLeft:2}}>외 {memos.length-3}건</span>}
+    </div>
+  );
+}
+
+/* ─── 요약 테이블 (강화) ─── */
+function SummaryTable({totals,currentMonth,prevMonth,units,aiComments}){
+  const rows=[
+    {label:"제조경비",c:totals.curr.mfg,p:totals.prev.mfg,color:"#1e40af",bg:"#eff6ff"},
+    {label:"판관비",c:totals.curr.sga,p:totals.prev.sga,color:"#7c3aed",bg:"#f5f3ff"},
+    {label:"기타",c:totals.curr.etc,p:totals.prev.etc,color:"#4b5563",bg:"#f9fafb"},
+  ];
+  const gc=rows.reduce((s,r)=>s+r.c,0),gp=rows.reduce((s,r)=>s+r.p,0);
+  const th={padding:"9px 12px",background:"#0f2040",color:"white",fontSize:12,fontWeight:700,textAlign:"right"};
+  const top3=units?units.slice(0,3):[];
+  const top3pct=gc>0?(top3.reduce((s,u)=>s+u.totalCurr,0)/gc*100).toFixed(1):0;
+  // 주요 증감 상위 3
+  const allFlat=[];units?.forEach(u=>u.accs.forEach(a=>allFlat.push({...a,unit:u.unit})));
+  allFlat.sort((a,b)=>Math.abs(b.diff)-Math.abs(a.diff));
+  const top3Up=allFlat.filter(a=>a.diff>0).slice(0,3);
+  const top3Dn=allFlat.filter(a=>a.diff<0).slice(0,3);
+  return(
+    <div>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,marginBottom:12}}>
+        <thead>
+          <tr>
+            <th style={{...th,textAlign:"left",paddingLeft:16}}>구분</th>
+            <th style={th}>{prevMonth?mLabel(prevMonth):"전월"}</th>
+            <th style={th}>{mLabel(currentMonth)}</th>
+            <th style={th}>증감액</th>
+            <th style={th}>증감률</th>
+            <th style={th}>비중</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r,i)=>{const d=r.c-r.p;const share=gc>0?(r.c/gc*100).toFixed(1):0;return(
+            <tr key={i} style={{background:r.bg}}>
+              <td style={{padding:"10px 12px",paddingLeft:16,fontWeight:700,color:r.color}}>{r.label}</td>
+              <td style={{padding:"10px 12px",textAlign:"right"}}>{fmt(r.p)}</td>
+              <td style={{padding:"10px 12px",textAlign:"right",fontWeight:600}}>{fmt(r.c)}</td>
+              <td style={{padding:"10px 12px",textAlign:"right",color:dColor(d),fontWeight:700}}>{dLabel(d)}</td>
+              <td style={{padding:"10px 12px",textAlign:"right",color:pctC(r.c,r.p)}}>{pctS(r.c,r.p)}</td>
+              <td style={{padding:"10px 12px",textAlign:"right",color:"#475569"}}>{share}%</td>
+            </tr>
+          );})}
+          <tr style={{background:"#0f2040"}}>
+            <td style={{padding:"10px 12px",paddingLeft:16,fontWeight:800,color:"white"}}>합 계</td>
+            <td style={{padding:"10px 12px",textAlign:"right",color:"rgba(255,255,255,0.8)"}}>{fmt(gp)}</td>
+            <td style={{padding:"10px 12px",textAlign:"right",fontWeight:800,color:"white"}}>{fmt(gc)}</td>
+            <td style={{padding:"10px 12px",textAlign:"right",color:dColor(gc-gp),fontWeight:800}}>{dLabel(gc-gp)}</td>
+            <td style={{padding:"10px 12px",textAlign:"right",color:pctC(gc,gp),fontWeight:700}}>{pctS(gc,gp)}</td>
+            <td style={{padding:"10px 12px",textAlign:"right",color:"rgba(255,255,255,0.7)"}}>100%</td>
+          </tr>
+        </tbody>
+      </table>
+      {/* 비용 집중도 */}
+      {top3.length>0&&(
+        <div style={{padding:"8px 14px",background:"#f8fafc",borderRadius:8,border:"1px solid #e2e8f0",fontSize:12,color:"#475569",marginBottom:10}}>
+          <b style={{color:"#1e293b"}}>비용 집중도</b>{" 상위 3개 단위("}{top3.map(u=>u.unit).join(", ")}{")가 전체 "}
+          <b style={{color:"#1e40af"}}>{top3pct}%</b>{" 차지"}
+        </div>
+      )}
+      {/* 주요 증감 요인 */}
+      {(top3Up.length>0||top3Dn.length>0)&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{background:"#fef2f2",borderRadius:8,padding:"10px 12px",border:"1px solid #fecaca"}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#b91c1c",marginBottom:6}}>주요 증가 항목</div>
+            {top3Up.map((a,i)=>(
+              <div key={i} style={{fontSize:11,marginBottom:4}}>
+                <span style={{color:"#1e293b",fontWeight:500}}>{a.unit} · {a.acc}</span>
+                <span style={{color:"#dc2626",fontWeight:700,float:"right"}}>{dLabel(a.diff)}원</span>
+              </div>
+            ))}
+          </div>
+          <div style={{background:"#f0fdf4",borderRadius:8,padding:"10px 12px",border:"1px solid #bbf7d0"}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#166534",marginBottom:6}}>주요 감소 항목</div>
+            {top3Dn.map((a,i)=>(
+              <div key={i} style={{fontSize:11,marginBottom:4}}>
+                <span style={{color:"#1e293b",fontWeight:500}}>{a.unit} · {a.acc}</span>
+                <span style={{color:"#16a34a",fontWeight:700,float:"right"}}>{dLabel(a.diff)}원</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── 단위별 아코디언 ─── */
+function UnitAccordion({units,aiComments}){
+  const [open,setOpen]=useState(null);
+  const grand=units.reduce((s,u)=>s+u.totalCurr,0);
+  return(
+    <div>
+      {units.map((u,i)=>{
+        const d=u.totalCurr-u.totalPrev,isOpen=open===i;
+        const ai=aiComments?.unitComments?.[u.unit];
+        const anomalies=u.accs.filter(a=>Math.abs(a.diff)>=ANOMALY_AMT);
+        const share=grand>0?(u.totalCurr/grand*100).toFixed(1):0;
+        const mR=u.totalCurr>0?(u.curr.mfg/u.totalCurr*100).toFixed(0):0;
+        const sR=u.totalCurr>0?(u.curr.sga/u.totalCurr*100).toFixed(0):0;
+        return(
+          <div key={i} style={{border:"1px solid #e2e8f0",borderRadius:10,marginBottom:8,overflow:"hidden"}}>
+            <div onClick={()=>setOpen(isOpen?null:i)} style={{padding:"13px 16px",display:"flex",alignItems:"center",gap:12,cursor:"pointer",background:isOpen?"#f0f9ff":"white"}}>
+              <span style={{color:"#64748b",fontSize:12,flexShrink:0}}>{isOpen?"▼":"▶"}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:14,color:"#1e293b"}}>{u.unit}</div>
+                <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>전체 비중 <b style={{color:"#1e40af"}}>{share}%</b>{" · 제조 "}{mR}{"% / 판관 "}{sR}{"%"}</div>
+              </div>
+              {anomalies.length>0&&<span style={{padding:"2px 8px",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:10,fontSize:10,color:"#b91c1c",fontWeight:700,flexShrink:0}}>{"⚠ "}{anomalies.length}{"건"}</span>}
+              <div style={{textAlign:"right",flexShrink:0}}>
+                <div style={{fontSize:14,fontWeight:800,color:dColor(d)}}>{dLabel(d)}{"원"}</div>
+                <div style={{fontSize:11,color:pctC(u.totalCurr,u.totalPrev)}}>{pctS(u.totalCurr,u.totalPrev)}</div>
+              </div>
+            </div>
+            {isOpen&&(
+              <div style={{padding:"0 16px 16px",borderTop:"1px solid #e2e8f0",background:"white"}}>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,margin:"14px 0"}}>
+                  {[{l:"제조경비",c:u.curr.mfg,p:u.prev.mfg,cl:"#1e40af",dk:false},{l:"판관비",c:u.curr.sga,p:u.prev.sga,cl:"#7c3aed",dk:false},{l:"기타",c:u.curr.etc,p:u.prev.etc,cl:"#4b5563",dk:false},{l:"합 계",c:u.totalCurr,p:u.totalPrev,cl:"white",dk:true}].map((s,j)=>(
+                    <div key={j} style={{padding:"10px 14px",background:s.dk?"#0f2040":"#f8fafc",borderRadius:8,border:"1px solid #e2e8f0"}}>
+                      <div style={{fontSize:11,color:s.dk?"rgba(255,255,255,0.55)":"#64748b",marginBottom:2,fontWeight:600}}>{s.l}</div>
+                      <div style={{fontSize:14,fontWeight:800,color:s.dk?"white":s.cl}}>{fmt(s.c)}</div>
+                      <div style={{fontSize:11,color:dColor(s.c-s.p),fontWeight:600}}>{dLabel(s.c-s.p)}</div>
+                    </div>
+                  ))}
+                </div>
+                {anomalies.length>0&&(
+                  <div style={{marginBottom:12,padding:"8px 14px",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:8,fontSize:12,color:"#b91c1c"}}>
+                    <b>{"500만원 이상 증감: "}</b>{anomalies.map(a=>a.acc+"("+dLabel(a.diff)+"원)").join(" · ")}
+                  </div>
+                )}
+                <div style={{overflowX:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,marginBottom:14}}>
+                    <thead>
+                      <tr style={{background:"#f1f5f9"}}>
+                        {["계정과목","구분","전월","당월","증감액","증감률","적요 (금액순)"].map((h,j)=>(
+                          <th key={j} style={{padding:"7px 10px",textAlign:j>=2&&j<=5?"right":"left",color:"#475569",fontWeight:700,fontSize:11,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {u.accs.map((a,j)=>{
+                        const anom=Math.abs(a.diff)>=ANOMALY_AMT;
+                        return(
+                          <tr key={j} style={{background:anom?"#fef2f2":j%2===0?"white":"#f8fafc",borderBottom:"1px solid #f1f5f9"}}>
+                            <td style={{padding:"7px 10px",fontWeight:anom?700:500,color:anom?"#b91c1c":"inherit",whiteSpace:"nowrap"}}>{anom&&<span style={{marginRight:4,fontSize:10}}>{"⚠"}</span>}{a.acc}</td>
+                            <td style={{padding:"7px 10px"}}><CatBadge cat={a.cat}/></td>
+                            <td style={{padding:"7px 10px",textAlign:"right"}}>{fmt(a.p)}</td>
+                            <td style={{padding:"7px 10px",textAlign:"right",fontWeight:600}}>{fmt(a.c)}</td>
+                            <td style={{padding:"7px 10px",textAlign:"right",color:dColor(a.diff),fontWeight:700}}>{dLabel(a.diff)}</td>
+                            <td style={{padding:"7px 10px",textAlign:"right",color:pctC(a.c,a.p)}}>{pctS(a.c,a.p)}</td>
+                            <td style={{padding:"7px 10px",minWidth:220}}><MemoList memos={a.memos}/></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {ai&&(
+                  <div style={{padding:"14px 16px",background:"linear-gradient(135deg,#fffbeb,#fefce8)",border:"1px solid #fde047",borderRadius:8}}>
+                    <div style={{fontSize:11,fontWeight:800,color:"#78350f",marginBottom:8}}>분석 코멘트</div>
+                    <p style={{fontSize:12,color:"#92400e",margin:"0 0 10px",fontWeight:600,lineHeight:1.7}}>{ai.summary}</p>
+                    <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                      {ai.details?.map((detail,k)=>(
+                        <div key={k} style={{fontSize:12,color:"#78350f",padding:"5px 5px 5px 10px",borderLeft:"3px solid #fbbf24",borderRadius:"0 4px 4px 0",background:"rgba(255,255,255,0.5)",lineHeight:1.6}}>{detail}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ─── TOP 증감 ─── */
+function TopChanges({units}){
+  const all=[];units.forEach(u=>u.accs.forEach(a=>all.push({...a,unit:u.unit})));
+  all.sort((a,b)=>Math.abs(b.diff)-Math.abs(a.diff));
+  return(
+    <div style={{overflowX:"auto"}}>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+        <thead><tr style={{background:"#f1f5f9"}}>{["순위","전표관리단위","계정과목","구분","증감액","증감률","주요 적요 (금액순)"].map((h,i)=>(
+          <th key={i} style={{padding:"7px 10px",textAlign:i>=4&&i<=5?"right":"left",color:"#475569",fontWeight:700,fontSize:11,whiteSpace:"nowrap"}}>{h}</th>
+        ))}</tr></thead>
+        <tbody>
+          {all.slice(0,15).map((a,i)=>(
+            <tr key={i} style={{borderBottom:"1px solid #f1f5f9",background:i%2===0?"white":"#f8fafc"}}>
+              <td style={{padding:"7px 10px",fontWeight:700,color:"#94a3b8"}}>{i+1}</td>
+              <td style={{padding:"7px 10px",fontWeight:500}}>{a.unit}</td>
+              <td style={{padding:"7px 10px"}}>{a.acc}</td>
+              <td style={{padding:"7px 10px"}}><CatBadge cat={a.cat}/></td>
+              <td style={{padding:"7px 10px",textAlign:"right",color:dColor(a.diff),fontWeight:800,fontSize:13}}>{dLabel(a.diff)}</td>
+              <td style={{padding:"7px 10px",textAlign:"right",color:pctC(a.c,a.p),fontWeight:600}}>{pctS(a.c,a.p)}</td>
+              <td style={{padding:"7px 10px",minWidth:200}}><MemoList memos={a.memos}/></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ─── 분석코멘트 탭 ─── */
+function CommentTab({aiComments}){
+  if(!aiComments)return <Card title="분석 코멘트"><p style={{color:"#94a3b8",padding:20,textAlign:"center"}}>결과가 없습니다.</p></Card>;
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      {Object.entries(aiComments.unitComments||{}).map(([unit,c],i)=>(
+        <div key={i} style={{background:"white",borderRadius:10,padding:"16px 20px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",border:"1px solid #e2e8f0"}}>
+          <div style={{fontSize:14,fontWeight:800,color:"#1e293b",marginBottom:8}}>{unit}</div>
+          <p style={{fontSize:13,color:"#374151",margin:"0 0 10px",lineHeight:1.65,fontWeight:500}}>{c.summary}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {c.details?.map((detail,j)=>(
+              <div key={j} style={{fontSize:12,color:"#4b5563",paddingLeft:10,borderLeft:"2px solid #3b82f6",lineHeight:1.6}}>{detail}</div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ─── 분석결과 탭 ─── */
+function ResultsTab({result,onExport}){
+  const{comparison,aiComments,currentMonth,prevMonth}=result;
+  const [tab,setTab]=useState("overview");
+  const TABS=[["overview","전체요약"],["units","단위별분석"],["top","TOP 증감"],["ai","분석코멘트"]];
+  return(
+    <div style={{maxWidth:1100}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <div>
+          <h2 style={{fontSize:20,fontWeight:800,color:"#0f2040",margin:0}}>분석 결과</h2>
+          <p style={{fontSize:13,color:"#64748b",margin:"4px 0 0"}}>{prevMonth?mLabel(prevMonth):"전월"}{" → "}{mLabel(currentMonth)}{" 비용 증감 분석"}</p>
+        </div>
+        <button onClick={onExport} style={{padding:"10px 22px",background:"#166534",color:"white",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}}>Excel 내보내기 (A3·전문가형)</button>
+      </div>
+      {aiComments?.overallComment&&(
+        <div style={{background:"linear-gradient(135deg,#0f2040,#1a3a6e)",borderRadius:12,padding:"18px 22px",marginBottom:18,color:"white"}}>
+          <div style={{fontSize:11,fontWeight:700,opacity:0.55,marginBottom:8,letterSpacing:"1px"}}>비용 증감 요약</div>
+          <p style={{fontSize:14,lineHeight:1.8,margin:0,opacity:0.95}}>{aiComments.overallComment}</p>
+          {(aiComments.keyInsights?.length>0||aiComments.warnings?.length>0)&&(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginTop:14,paddingTop:14,borderTop:"1px solid rgba(255,255,255,0.15)"}}>
+              {aiComments.keyInsights?.length>0&&(
+                <div><div style={{fontSize:11,fontWeight:700,opacity:0.6,marginBottom:6}}>핵심 분석 결과</div>
+                  {aiComments.keyInsights.map((k,i)=><p key={i} style={{fontSize:12,margin:"3px 0",opacity:0.85}}>{"• "}{k}</p>)}</div>
+              )}
+              {aiComments.warnings?.length>0&&(
+                <div><div style={{fontSize:11,fontWeight:700,color:"#fbbf24",marginBottom:6}}>주의 항목</div>
+                  {aiComments.warnings.map((w,i)=><p key={i} style={{fontSize:12,margin:"3px 0",color:"#fde68a"}}>{"• "}{w}</p>)}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{display:"flex",gap:4,marginBottom:16,borderBottom:"2px solid #e2e8f0"}}>
+        {TABS.map(([id,label])=>(
+          <button key={id} onClick={()=>setTab(id)} style={{padding:"8px 16px",background:"none",border:"none",borderBottom:tab===id?"2px solid #1d4ed8":"2px solid transparent",color:tab===id?"#1d4ed8":"#64748b",fontWeight:tab===id?700:500,fontSize:13,cursor:"pointer",marginBottom:-2}}>{label}</button>
+        ))}
+      </div>
+      {tab==="overview"&&(
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1.3fr",gap:16,marginBottom:16}}>
+            <Card title="비용 구분별 요약" accent="#1d4ed8"><SummaryTable totals={comparison.totals} currentMonth={currentMonth} prevMonth={prevMonth} units={comparison.units} aiComments={aiComments}/></Card>
+            <Card title="단위별 당월 비용 (억원)" accent="#1d4ed8"><CostChart units={comparison.units}/></Card>
+          </div>
+          <div style={{padding:"8px 14px",background:"#fffbeb",borderRadius:8,border:"1px solid #fde047",fontSize:11,color:"#92400e"}}>
+            <b>분석 제외 계정과목:</b>{" "}{EXCLUDE_DISPLAY.join(", ")}{" — 이중계상 방지 및 집계 대분류 항목으로 세부 분석에서 제외됨."}
+          </div>
+        </div>
+      )}
+      {tab==="units"&&<Card title="전표관리단위별 상세 분석"><UnitAccordion units={comparison.units} aiComments={aiComments}/></Card>}
+      {tab==="top"&&<Card title="주요 증감 TOP 15 (증감액 기준)"><TopChanges units={comparison.units}/></Card>}
+      {tab==="ai"&&<CommentTab aiComments={aiComments}/>}
+    </div>
+  );
+}
+
+/* ─── 나머지 탭들 ─── */
+function UploadTab({currFile,prevFile,onCurrUpload,onPrevUpload,onAnalyze,analyzing,error,hasKey,history,onPrevHist}){
+  return(
+    <div style={{maxWidth:760}}>
+      <h2 style={{fontSize:20,fontWeight:800,color:"#0f2040",marginBottom:4}}>분석하기</h2>
+      <p style={{fontSize:13,color:"#64748b",marginBottom:20}}>ERP Excel 파일을 업로드하고 비용 증감 분석을 실행합니다</p>
+      <Card title="파일 업로드" mb={16}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <DropZone label="당월 파일" fileName={currFile} onUpload={onCurrUpload} required={true}/>
+          <DropZone label="전월 파일" fileName={prevFile} onUpload={onPrevUpload} badge="비교기준"/>
+        </div>
+        {history.length>0&&!prevFile&&(
+          <div style={{marginTop:14,padding:"10px 14px",background:"#eff6ff",borderRadius:8,border:"1px solid #bfdbfe"}}>
+            <p style={{margin:"0 0 8px",fontSize:12,fontWeight:700,color:"#1e40af"}}>히스토리에서 전월 선택</p>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8}}>{history.slice(0,6).map((h,i)=>(
+              <button key={i} onClick={()=>onPrevHist(h)} style={{padding:"4px 12px",background:"white",border:"1px solid #93c5fd",borderRadius:20,fontSize:12,cursor:"pointer",color:"#1d4ed8",fontWeight:500}}>{mLabel(h.currentMonth)}</button>
+            ))}</div>
+          </div>
+        )}
+      </Card>
+      <Card title="분석 항목" mb={16}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13,color:"#374151"}}>
+          {["전표관리단위별 전월 대비 분석","판관비 / 제조경비 분류 분석","계정과목 상위분류 기준 집계","적요 금액순 정렬 및 금액 표시","500만원 이상 이상 항목 탐지","주요 증감 TOP 15 추출","히스토리 자동 저장","Excel A3 전문가형 내보내기"].map(t=>(
+            <div key={t} style={{display:"flex",alignItems:"center",gap:6}}><span style={{color:"#16a34a",fontWeight:700}}>{"✓"}</span>{t}</div>
+          ))}
+        </div>
+        {!hasKey&&<div style={{marginTop:12,padding:"10px 14px",background:"#fef9c3",borderRadius:8,border:"1px solid #fde047",fontSize:13,color:"#713f12"}}>Gemini API 키가 없습니다. 설정 메뉴에서 입력하세요.</div>}
+      </Card>
+      <Card title="분석 제외 계정과목 (원가성 대분류 등)" mb={16} accent="#f59e0b">
+        <p style={{fontSize:12,color:"#64748b",marginBottom:8}}>아래 계정과목은 분석 결과에서 제외됩니다. 이중계상 또는 집계 대분류 항목으로 세부 분석 가치가 낮아 제외하였습니다.</p>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+          {EXCLUDE_DISPLAY.map(k=>(
+            <span key={k} style={{padding:"3px 10px",background:"#fef9c3",border:"1px solid #fde047",borderRadius:20,fontSize:11,color:"#92400e",fontWeight:500}}>{k}</span>
+          ))}
+        </div>
+      </Card>
+      {error&&<div style={{padding:"10px 14px",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,fontSize:13,color:"#b91c1c",marginBottom:16}}>{error}</div>}
+      <button onClick={onAnalyze} disabled={analyzing||!currFile||!hasKey}
+        style={{padding:"14px 44px",background:(analyzing||!currFile||!hasKey)?"#94a3b8":"linear-gradient(135deg,#1a3a6e,#2563eb)",color:"white",border:"none",borderRadius:10,fontSize:15,fontWeight:800,cursor:(analyzing||!currFile||!hasKey)?"not-allowed":"pointer",display:"flex",alignItems:"center"}}>
+        {analyzing?<><Spinner/>{"분석 중..."}</>:"분석 실행"}
+      </button>
+    </div>
+  );
+}
+function HistoryTab({history,onSelect,onDelete}){
+  if(!history.length)return(<div style={{textAlign:"center",padding:"80px 20px",color:"#94a3b8"}}><p style={{fontSize:15,fontWeight:600,marginBottom:8}}>저장된 히스토리가 없습니다</p><p style={{fontSize:13}}>분석을 실행하면 자동으로 저장됩니다.</p></div>);
+  return(
+    <div style={{maxWidth:800}}>
+      <h2 style={{fontSize:20,fontWeight:800,color:"#0f2040",marginBottom:4}}>분석 히스토리</h2>
+      <p style={{fontSize:13,color:"#64748b",marginBottom:20}}>과거 분석 결과를 확인하고 전월 기준으로 활용하세요</p>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {history.map((h,i)=>{
+          const tot=h.comparison?.totals;const gc=tot?tot.curr.mfg+tot.curr.sga+tot.curr.etc:0;const gp=tot?tot.prev.mfg+tot.prev.sga+tot.prev.etc:0;
+          return(<div key={i} style={{background:"white",borderRadius:10,padding:"16px 20px",boxShadow:"0 1px 4px rgba(0,0,0,0.07)",display:"flex",alignItems:"center",gap:14,border:"1px solid #e2e8f0"}}>
+            <div style={{width:44,height:44,background:"linear-gradient(135deg,#1a3a6e,#2563eb)",borderRadius:10,flexShrink:0}}></div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:15,fontWeight:800,color:"#1e293b"}}>{mLabel(h.currentMonth)}{" 실적 분석"}</div>
+              <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{h.prevMonth?mLabel(h.prevMonth)+" 대비":"단독 분석"}{" · "}{new Date(h.savedAt).toLocaleString("ko-KR")}</div>
+              {tot&&<div style={{fontSize:13,marginTop:4}}>{"총비용 "}<b>{fmt(gc)}</b>{"원 · 전월比 "}<span style={{color:dColor(gc-gp),fontWeight:700}}>{dLabel(gc-gp)}{"원"}</span></div>}
+            </div>
+            <div style={{display:"flex",gap:8,flexShrink:0}}>
+              <button onClick={()=>onSelect(h)} style={{padding:"8px 16px",background:"#1a3a6e",color:"white",border:"none",borderRadius:6,fontSize:12,cursor:"pointer",fontWeight:600}}>보기</button>
+              <button onClick={()=>onDelete(h.key)} style={{padding:"8px 16px",background:"white",color:"#dc2626",border:"1px solid #fca5a5",borderRadius:6,fontSize:12,cursor:"pointer"}}>삭제</button>
+            </div>
+          </div>);
+        })}
+      </div>
+    </div>
+  );
+}
+function SettingsTab({settings,onSave}){
+  const [key,setKey]=useState(settings.geminiKey||"");
+  const [id,setId]=useState(settings.creds?.id||"admin");
+  const [pw,setPw]=useState(settings.creds?.pw||"halla2026");
+  const [saved,setSaved]=useState(false);
+  function save(){onSave({geminiKey:key,creds:{id,pw}});setSaved(true);setTimeout(()=>setSaved(false),2000);}
+  const inp={width:"100%",padding:"10px 13px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:14,background:"#f8fafc"};
+  const lbl={fontSize:12,fontWeight:700,color:"#374151",display:"block",marginBottom:5};
+  return(
+    <div style={{maxWidth:600}}>
+      <h2 style={{fontSize:20,fontWeight:800,color:"#0f2040",marginBottom:4}}>설정</h2>
+      <p style={{fontSize:13,color:"#64748b",marginBottom:20}}>Gemini API 키 및 로그인 계정을 관리합니다</p>
+      <Card title="Gemini API 설정" mb={16}>
+        <label style={lbl}>Google Gemini API 키 (gemini-2.5-flash)</label>
+        <input type="password" value={key} onChange={e=>setKey(e.target.value)} placeholder="AIza..." style={inp}/>
+        <div style={{marginTop:8,padding:"10px 12px",background:"#eff6ff",borderRadius:7,border:"1px solid #bfdbfe",fontSize:12,color:"#1e40af"}}>
+          Google AI Studio (aistudio.google.com) → API 키 발급 → 여기에 입력
+        </div>
+      </Card>
+      <Card title="로그인 계정 관리" mb={16}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <div><label style={lbl}>아이디</label><input value={id} onChange={e=>setId(e.target.value)} style={inp}/></div>
+          <div><label style={lbl}>비밀번호</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} style={inp}/></div>
+        </div>
+      </Card>
+      <Card title="ERP 파일 컬럼 구조 (고정)" mb={20}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13,color:"#4b5563"}}>
+          {[["B열(index 1)","회계일"],["D열(index 3)","전표관리단위"],["Q열(index 16)","계정과목"],["R열(index 17)","차변금액"],["V열(index 21)","적요"]].map(([col,name])=>(
+            <div key={col} style={{display:"flex",gap:8,padding:"7px 10px",background:"#f8fafc",borderRadius:6}}>
+              <span style={{fontWeight:700,color:"#1e40af",minWidth:100}}>{col}</span><span>{name}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+      <button onClick={save} style={{padding:"12px 32px",background:"linear-gradient(135deg,#1a3a6e,#2563eb)",color:"white",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:"pointer"}}>{saved?"저장 완료":"저장"}</button>
+    </div>
+  );
+}
+
+/* ─── 로그인 ─── */
+function Login({onLogin}){
+  const [id,setId]=useState(""); const [pw,setPw]=useState(""); const [err,setErr]=useState("");
+  function doLogin(){const s=lsGet("app:settings")||{creds:DEFAULT_CREDS};const cr=s.creds||DEFAULT_CREDS;if(id===cr.id&&pw===cr.pw)onLogin();else setErr("아이디 또는 비밀번호가 올바르지 않습니다.");}
+  const inp={width:"100%",padding:"11px 14px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:14,outline:"none",background:"#f8fafc"};
+  return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(145deg,#0f2040,#1a3a6e)"}}>
+      <div style={{width:380,padding:"40px 36px",background:"rgba(255,255,255,0.97)",borderRadius:16,boxShadow:"0 24px 80px rgba(0,0,0,0.45)"}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{width:50,height:50,margin:"0 auto 14px",background:"linear-gradient(135deg,#1a3a6e,#2563eb)",borderRadius:14}}></div>
+          <h1 style={{margin:0,fontSize:22,fontWeight:800,color:"#0f2040"}}>비용실적 분석시스템</h1>
+          <p style={{margin:"6px 0 0",fontSize:13,color:"#64748b"}}>한라엔컴㈜ ERP 비용 분석 플랫폼</p>
+        </div>
+        <div style={{marginBottom:14}}><label style={{fontSize:12,fontWeight:700,color:"#374151",display:"block",marginBottom:5}}>아이디</label><input value={id} onChange={e=>setId(e.target.value)} onKeyDown={e=>e.key==="Enter"&&doLogin()} style={inp}/></div>
+        <div style={{marginBottom:14}}><label style={{fontSize:12,fontWeight:700,color:"#374151",display:"block",marginBottom:5}}>비밀번호</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==="Enter"&&doLogin()} style={inp}/></div>
+        {err&&<div style={{padding:"8px 12px",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:6,fontSize:13,color:"#dc2626",marginBottom:12}}>{err}</div>}
+        <button onClick={doLogin} style={{width:"100%",padding:"13px",background:"linear-gradient(135deg,#1a3a6e,#2563eb)",color:"white",border:"none",borderRadius:8,fontSize:15,fontWeight:700,cursor:"pointer",marginTop:4}}>로그인</button>
+        <p style={{fontSize:11,color:"#94a3b8",textAlign:"center",margin:"16px 0 0"}}>기본 계정: admin / halla2026</p>
+      </div>
+    </div>
+  );
+}
+/* ─── 사이드바 ─── */
+function Sidebar({active,onNav,onLogout}){
+  const NAV=[{id:"upload",label:"분석하기"},{id:"results",label:"분석결과"},{id:"history",label:"히스토리"},{id:"settings",label:"설정"}];
+  return(
+    <div style={{width:190,background:"#0f2040",display:"flex",flexDirection:"column",flexShrink:0}}>
+      <div style={{padding:"22px 20px 18px",borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+        <div style={{fontSize:14,fontWeight:800,color:"white"}}>비용분석시스템</div>
+        <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",marginTop:3}}>한라엔컴㈜</div>
+      </div>
+      <nav style={{flex:1,paddingTop:8}}>
+        {NAV.map(n=>(
+          <button key={n.id} onClick={()=>onNav(n.id)} style={{width:"100%",padding:"11px 20px",display:"flex",alignItems:"center",background:active===n.id?"rgba(255,255,255,0.12)":"transparent",border:"none",borderLeft:active===n.id?"3px solid #3b82f6":"3px solid transparent",color:active===n.id?"white":"rgba(255,255,255,0.5)",cursor:"pointer",fontSize:13,textAlign:"left",fontWeight:active===n.id?700:400}}>{n.label}</button>
+        ))}
+      </nav>
+      <div style={{padding:"16px 20px",borderTop:"1px solid rgba(255,255,255,0.08)"}}>
+        <button onClick={onLogout} style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:6,color:"rgba(255,255,255,0.5)",cursor:"pointer",fontSize:12}}>로그아웃</button>
+      </div>
+    </div>
+  );
+}
+/* ─── 드롭존 ─── */
+function DropZone({label,fileName,onUpload,required,badge}){
+  const ref=useRef();const [drag,setDrag]=useState(false);
+  function handle(file){if(!file||(!file.name.endsWith(".xlsx")&&!file.name.endsWith(".xls"))){alert("xlsx/xls만 지원합니다.");return;}onUpload(file);}
+  return(
+    <div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+        <label style={{fontSize:13,fontWeight:700,color:"#1e293b"}}>{label}</label>
+        {required&&<span style={{fontSize:10,padding:"1px 6px",background:"#fee2e2",color:"#dc2626",borderRadius:4,fontWeight:700}}>필수</span>}
+        {badge&&<span style={{fontSize:10,padding:"1px 6px",background:"#dbeafe",color:"#1d4ed8",borderRadius:4}}>{badge}</span>}
+      </div>
+      <div onClick={()=>ref.current.click()} onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);handle(e.dataTransfer.files[0]);}}
+        style={{border:`2px dashed ${fileName?"#16a34a":drag?"#3b82f6":"#cbd5e1"}`,borderRadius:10,padding:"18px 16px",textAlign:"center",cursor:"pointer",background:fileName?"#f0fdf4":drag?"#eff6ff":"#f8fafc"}}>
+        {fileName?<p style={{margin:0,fontSize:12,color:"#166534",fontWeight:600}}>{"✓ "}{fileName}</p>:<div><p style={{margin:0,fontSize:12,color:"#64748b"}}>클릭 또는 드래그</p><p style={{margin:"2px 0 0",fontSize:11,color:"#94a3b8"}}>.xlsx / .xls</p></div>}
+      </div>
+      <input ref={ref} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>e.target.files[0]&&handle(e.target.files[0])}/>
+    </div>
+  );
+}
+/* ─── 메인 앱 ─── */
+function App(){
+  const [loggedIn,setLoggedIn]=useState(false);
+  const [tab,setTab]=useState("upload");
+  const [settings,setSettings]=useState({geminiKey:"",creds:DEFAULT_CREDS});
+  const [currFile,setCurrFile]=useState(null);const [prevFile,setPrevFile]=useState(null);
+  const [currData,setCurrData]=useState(null);const [prevData,setPrevData]=useState(null);
+  const [result,setResult]=useState(null);const [analyzing,setAnalyzing]=useState(false);
+  const [error,setError]=useState("");const [history,setHistory]=useState([]);
+  useEffect(()=>{const s=lsGet("app:settings");if(s)setSettings(s);loadHist();},[]);
+  function loadHist(){const keys=lsList("analysis:");const items=keys.map(k=>{const v=lsGet(k);return v?{key:k,...v}:null;}).filter(Boolean);items.sort((a,b)=>(b.savedAt||"").localeCompare(a.savedAt||""));setHistory(items);}
+  function saveSettings(s){setSettings(s);lsSet("app:settings",s);}
+  function loadFile(file,type){
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const wb=XLSX.read(e.target.result,{type:"array"});
+        const recs=parseERP(wb);const agg=aggregate(recs);const months=Object.keys(agg).sort();
+        if(!months.length){alert("데이터를 찾을 수 없습니다.");return;}
+        const data={recs,agg,months,fileName:file.name};
+        if(type==="curr"){setCurrData(data);setCurrFile(file.name);}else{setPrevData(data);setPrevFile(file.name);}
+      }catch(err){alert("파일 파싱 오류: "+err.message);}
+    };
+    reader.readAsArrayBuffer(file);
+  }
+  function usePrevHist(h){
+    const recAgg={};
+    h.comparison?.units?.forEach(u=>{recAgg[u.unit]={};u.accs.forEach(a=>{recAgg[u.unit][a.acc]={amt:a.c,memos:a.memos||[],cat:a.cat};});});
+    setPrevData({fromHistory:true,recAgg,months:[h.currentMonth],fileName:mLabel(h.currentMonth)+" (히스토리)"});
+    setPrevFile(mLabel(h.currentMonth)+" (히스토리)");
+  }
+  async function runAnalysis(){
+    if(!currData){alert("당월 파일을 업로드해주세요.");return;}
+    if(!settings.geminiKey){alert("설정 메뉴에서 Gemini API 키를 입력해주세요.");return;}
+    setAnalyzing(true);setError("");
+    try{
+      const currentMonth=currData.months[currData.months.length-1];
+      const currAgg=currData.agg[currentMonth]||{};
+      let prevAgg={},prevMonth=null;
+      if(prevData){if(prevData.fromHistory){prevAgg=prevData.recAgg||{};prevMonth=prevData.months[0];}else{prevMonth=prevData.months[prevData.months.length-1];prevAgg=prevData.agg[prevMonth]||{};}}
+      const comparison=buildCompare(currAgg,prevAgg);
+      const aiComments=await analyze(comparison,currentMonth,prevMonth,settings.geminiKey);
+      const res={currentMonth,prevMonth,comparison,aiComments,currentFileName:currData.fileName,prevFileName:prevData?.fileName||null,savedAt:new Date().toISOString()};
+      setResult(res);lsSet("analysis:"+currentMonth+"_"+Date.now(),res);loadHist();setTab("results");
+    }catch(err){
+      const msg=err.message||"";
+      setError(msg.includes("과부하")||msg.includes("high demand")||msg.includes("overloaded")?"Gemini 서버 일시 과부하. 잠시 후 분석 실행을 다시 눌러주세요.":"오류: "+msg);
+    }finally{setAnalyzing(false);}
+  }
+  if(!loggedIn)return <Login onLogin={()=>setLoggedIn(true)}/>;
+  return(
+    <div style={{display:"flex",height:"100vh",fontFamily:"'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',sans-serif",background:"#f0f4f8"}}>
+      <Sidebar active={tab} onNav={setTab} onLogout={()=>setLoggedIn(false)}/>
+      <main style={{flex:1,overflow:"auto",padding:"24px 28px"}}>
+        {tab==="upload"&&<UploadTab currFile={currFile} prevFile={prevFile} onCurrUpload={f=>loadFile(f,"curr")} onPrevUpload={f=>loadFile(f,"prev")} onAnalyze={runAnalysis} analyzing={analyzing} error={error} hasKey={!!settings.geminiKey} history={history} onPrevHist={usePrevHist}/>}
+        {tab==="results"&&result&&<ResultsTab result={result} onExport={()=>exportXLS(result)}/>}
+        {tab==="results"&&!result&&(<div style={{textAlign:"center",padding:"100px 20px",color:"#94a3b8"}}><p style={{fontSize:15,fontWeight:600,marginBottom:8}}>분석 결과가 없습니다</p><p style={{fontSize:13}}>분석하기 탭에서 파일을 업로드하고 분석을 실행하세요.</p></div>)}
+        {tab==="history"&&<HistoryTab history={history} onSelect={h=>{setResult(h);setTab("results");}} onDelete={k=>{lsDel(k);loadHist();}}/>}
+        {tab==="settings"&&<SettingsTab settings={settings} onSave={saveSettings}/>}
+      </main>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+
+</script>
+</body>
+</html>
